@@ -20,8 +20,9 @@ export async function main(ns) {
     while (true) {
         let cost = ns.getUpgradeHomeRamCost();
         let currentRam = ns.getServerMaxRam("home");
-        if (cost >= Number.MAX_VALUE)
+        if (cost >= Number.MAX_VALUE || currentRam == 1073741824){
             return ns.print(`We're at max home RAM (${formatRam(currentRam)})`);
+        }
         const nextRam = currentRam * 2;
         const upgradeDesc = `home RAM from ${formatRam(currentRam)} to ${formatRam(nextRam)}`;
         if (spendable < cost)

@@ -40,7 +40,7 @@ export async function main(ns) {
                 }
                 // Detect and notify the HUD if we are liquidating hashes (selling them as quickly as possible)               
                 if (ns.isRunning('spend-hacknet-hashes.js', 'home', '--liquidate') || ns.isRunning('spend-hacknet-hashes.js', 'home', '-l')) {
-                    headers.push(" ");
+                    headers.push(" ");
                     values.push("Liquidating");
                 }
             }
@@ -96,7 +96,7 @@ export async function main(ns) {
                 values.push(formatNumberShort(sharePower, 3, 2));
             }
 
-            hook0.innerText = headers.join(" \n");
+            hook0.innerText = headers.join(" \n");
             hook1.innerText = values.join("\n");
         } catch (err) { // Might run out of ram from time to time, since we use it dynamically
             ns.print("ERROR: Update Skipped: " + String(err));

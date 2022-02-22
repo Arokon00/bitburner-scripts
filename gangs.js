@@ -1,23 +1,21 @@
-import { formatMoney, formatNumberShort, getNsDataThroughFile, getActiveSourceFiles, runCommand, tryGetBitNodeMultipliers, formatDuration } from './helpers.js'
+import { formatMoney, formatNumberShort, getNsDataThroughFile, getActiveSourceFiles, runCommand, tryGetBitNodeMultipliers } from './helpers.js'
 
-// Global config
-const updateInterval = 200; // We can improve our timing by updating more often than gang stats do (which is every 2 seconds for stats, every 20 seconds for territory)
-const wantedPenaltyThreshold = 0.0001; // Don't let the wanted penalty get worse than this
-let defaultMaxSpendPerTickTransientEquipment = 0.002; // If the --equipment-budget is not specified, spend up to this percent of non-reserved cash on temporary upgrades (equipment)
-let defaultMaxSpendPerTickPermanentEquipment = 0.2; // If the --augmentation-budget is not specified, spend up to this percent of non-reserved cash on permanent member upgrades
+// Global constants
+const updateInterval = 200;
+const maxSpendPerTickTransientEquipment = 0.002;
+const maxSpendPerTickPermanentEquipment = 0.2; // Spend up to this percent of non-reserved cash on permanent member upgrades
+const wantedPenaltyThreshold = 0.5; // Don't let the wanted penalty get worse than this
 
 // Territory-related variables
 const gangsByPower = ["Speakers for the Dead", "The Dark Army", "The Syndicate", "Slum Snakes", /* Hack gangs don't scale as far */ "The Black Hand", /* "NiteSec" Been there, not fun. */]
-const territoryEngageThreshold = 0.60; // Minimum average win chance (of gangs with territory) before we engage other clans
+const territoryEngageThreshold = 0.70; // Minimum average win chance (of gangs with territory) before we engage other clans
 let territoryTickDetected = false;
 let territoryTickTime = 20000; // Est. milliseconds until territory *ticks*. Can vary if processing offline time
-let territoryTickWaitPadding = 200; // Start waiting this many milliseconds before we think territory will tick, in case it ticks early (increases automatically after misfires)
 let territoryNextTick = null; // The next time territory will tick
 let isReadyForNextTerritoryTick = false;
 let warfareFinished = false;
 let lastTerritoryPower = 0;
 let lastOtherGangInfo = null;
-let lastLoopTime = null;
 
 // Crime activity-related variables TODO all tasks list to evaluate
 const crimes = ["Mug People", "Deal Drugs", "Strongarm Civilians", "Run a Con", "Armed Robbery", "Traffick Illegal Arms", "Threaten & Blackmail", "Human Trafficking", "Terrorism",
@@ -47,9 +45,6 @@ const argsSchema = [
     ['ascend-multi-threshold-spacing', 0.05], // Members will space their acention multis by this amount to ensure they are ascending at different rates 
     // Note: given the above two defaults, members would ascend at multis [1.6, 1.55, 1.50, ..., 1.1, 1.05] once you have 12 members.
     ['min-training-ticks', 20], // Require this many ticks of training after ascending or recruiting
-    ['reserve', null], // Reserve this much cash before determining spending budgets (defaults to contents of reserve.txt if not specified)
-    ['augmentations-budget', null], // Percentage of non-reserved cash to spend per tick on permanent member upgrades (If not specified, uses defaultMaxSpendPerTickPermanentEquipment)
-    ['equipment-budget', null], // Percentage of non-reserved cash to spend per tick on permanent member upgrades (If not specified, uses defaultMaxSpendPerTickTransientEquipment)
 ];
 
 export function autocomplete(data, _) {
@@ -95,8 +90,10 @@ async function initialize(ns) {
     if (loggedWaiting) log(ns, `SUCCESS: Created gang ${myGangFaction}`, 'success', true);
     isHackGang = myGangInfo.isHacking;
     importantStats = isHackGang ? ["hack"] : ["str", "def", "dex", "agi"];
-    territoryNextTick = lastTerritoryPower = lastOtherGangInfo = null;
+    lastTerritoryPower = myGangInfo.power;
+    territoryNextTick = Date.now() + territoryTickTime; // Expect to miss be "caught unaware" by the first territory tick
     territoryTickDetected = isReadyForNextTerritoryTick = warfareFinished = false;
+    lastOtherGangInfo = null;
 
     // If possible, determine how much rep we would need to get the most expensive unowned augmentation
     const sf4Level = ownedSourceFiles[4] || 0;
@@ -122,13 +119,6 @@ async function initialize(ns) {
     if (requiredRep == -1)
         requiredRep = 2.5e6
 
-    // Hack: Default aug budget is cut by 1/100 in a few situations (TODO: Add more, like when gang income is severely nerfed)
-    const playerData = await getNsDataThroughFile(ns, 'ns.getPlayer()', '/Temp/player-info.txt');
-    if (!playerData.has4SDataTixApi || playerData.bitNodeN === 8) {
-        defaultMaxSpendPerTickPermanentEquipment /= 100;
-        defaultMaxSpendPerTickTransientEquipment /= 100;;
-    }
-
     // Initialize equipment information
     const equipmentNames = await getNsDataThroughFile(ns, 'ns.gang.getEquipmentNames()', '/Temp/gang-equipment-names.txt');
     const dictEquipmentTypes = await getGangInfoDict(ns, equipmentNames, 'getEquipmentType');
@@ -150,10 +140,7 @@ async function initialize(ns) {
     for (const member of Object.values(dictMembers)) // Initialize the current activity of each member
         assignedTasks[member.name] = (member.task && member.task !== "Unassigned") ? member.task : ("Train " + (isHackGang ? "Hacking" : "Combat"));
     while (myGangMembers.length < 3) await doRecruitMember(ns); // We should be able to recruit our first three members immediately (for free)
-    // Peform all updates / actions normally performed on territory tick (every 20 seconds) once before starting the main loop
-    lastLoopTime = Date.now()
-    await onTerritoryTick(ns, myGangInfo);
-    lastTerritoryPower = myGangInfo.power;
+    await optimizeGangCrime(ns, myGangInfo);
 }
 
 /** @param {NS} ns 
@@ -161,46 +148,34 @@ async function initialize(ns) {
 async function mainLoop(ns) {
     // Update gang information (specifically monitoring gang power to see when territory ticks)
     const myGangInfo = ns.gang.getGangInformation(); //await getNsDataThroughFile(ns, 'ns.gang.getGangInformation()', '/Temp/gang-info.txt');
-    const thisLoopStart = Date.now();
-    if (!territoryTickDetected) { // Detect the first territory tick by watching for other gang's territory power to update.
+    // If territory is about to tick, quick - set everyone to do "territory warfare"!
+    if (!isReadyForNextTerritoryTick && territoryTickDetected && (Date.now() + updateInterval >= territoryNextTick)) {
+        isReadyForNextTerritoryTick = true;
+        await updateMemberActivities(ns, null, "Territory Warfare");
+    } else if (!territoryTickDetected) { // Detect the first territory tick by watching for other gang's territory power to update.
         const otherGangInfo = await getNsDataThroughFile(ns, 'ns.gang.getOtherGangInformation()', '/Temp/gang-other-gang-info.txt'); // Returns dict of { [gangName]: { "power": Number, "territory": Number } }
-        if (lastOtherGangInfo != null && JSON.stringify(otherGangInfo) != JSON.stringify(lastOtherGangInfo)) {
-            territoryNextTick = lastLoopTime + territoryTickTime;
+        if (lastOtherGangInfo != null && Object.keys(otherGangInfo).some(g => otherGangInfo[g].power != lastOtherGangInfo[g].power)) {
+            territoryNextTick = Date.now() - updateInterval;
             territoryTickDetected = true;
-            log(ns, `INFO: Others gangs power updated (sometime in the past ${formatDuration(thisLoopStart - lastLoopTime)}. ` +
-                `Will start waiting for next tick in: ${formatDuration(territoryNextTick - thisLoopStart - territoryTickWaitPadding)}`, 'warning');
-        } else if (lastOtherGangInfo == null)
-            log(ns, `INFO: Waiting to detect territory to tick. (Waiting for other gangs' power to update.) Will check every ${formatDuration(updateInterval)}...`);
+        }
         lastOtherGangInfo = otherGangInfo;
     }
-    // If territory is close to ticking, quick - set everyone to do "territory warfare"! Once we hit 100% territory, there's no need to keep swapping members to warfare
-    if (!warfareFinished && !isReadyForNextTerritoryTick && (thisLoopStart + updateInterval + territoryTickWaitPadding >= territoryNextTick)) { // Start 1 second early to be safe
-        isReadyForNextTerritoryTick = true;
-        await updateMemberActivities(ns, null, "Territory Warfare", myGangInfo);
-    }
     // Detect if territory power has been updated in the last tick (or if we have no power, assume it has ticked and we just haven't generated power yet)
-    if ((isReadyForNextTerritoryTick && myGangInfo.power != lastTerritoryPower) || (thisLoopStart > territoryNextTick + 5000 /* Wait up to 5 additional seconds in case time was wonkey */)) {
+    if ((isReadyForNextTerritoryTick && myGangInfo.power != lastTerritoryPower) || (Date.now() > territoryNextTick + 5 * updateInterval)) {
         await onTerritoryTick(ns, myGangInfo); //Do most things only once per territory tick
-        isReadyForNextTerritoryTick = false;
         lastTerritoryPower = myGangInfo.power;
-    } else if (isReadyForNextTerritoryTick)
-        log(ns, `INFO: Waiting for territory to tick. (Waiting for gang power to change from ${formatNumberShort(lastTerritoryPower)}. ETA: ${formatDuration(territoryNextTick - thisLoopStart)}`);
-    lastLoopTime = thisLoopStart; // Due to periodic lag, we must track the last time we checked, can't assume it was `updateInterval` ago.
+    }
 }
 
 /** @param {NS} ns 
  * Do some things only once per territory tick **/
 async function onTerritoryTick(ns, myGangInfo) {
-    territoryNextTick = lastLoopTime + territoryTickTime; // Reset the time the next tick will occur
-    if (lastTerritoryPower != myGangInfo.power || lastTerritoryPower == null) {
+    territoryNextTick = Date.now() - updateInterval + territoryTickTime; // Reset the time the next tick will occur
+    if (lastTerritoryPower != myGangInfo.power)
         log(ns, `Territory power updated from ${formatNumberShort(lastTerritoryPower)} to ${formatNumberShort(myGangInfo.power)}.`)
-    } else if (!warfareFinished) {
-        log(ns, `WARNING: Power stats weren't updated, assuming we've lost track of territory tick`, 'warning');
-        territoryTickWaitPadding = Math.max(2000, territoryTickWaitPadding + updateInterval); // Start waiting earlier to account for observed lag.
-        territoryNextTick -= updateInterval; // Prep for the next tick a little earlier, in case we just lagged behind the tick by a bit.
-        territoryTickDetected = false;
-        lastOtherGangInfo = null;
-    }
+    if (!isReadyForNextTerritoryTick) log(ns, `WARNING: Territory tick happend before we were ready!`, 'warning');
+    if (!warfareFinished) // Once we hit 100% territory, there's no need to keep swapping members to warfare
+        isReadyForNextTerritoryTick = false;
 
     // Update gang members in case someone died in a clash
     myGangMembers = await getNsDataThroughFile(ns, 'ns.gang.getMemberNames()', '/Temp/gang-member-names.txt');
@@ -219,20 +194,17 @@ async function onTerritoryTick(ns, myGangInfo) {
 
 /** @param {NS} ns 
  * Consolidated logic for telling members what to do **/
-async function updateMemberActivities(ns, dictMemberInfo = null, forceTask = null, myGangInfo = null) {
+async function updateMemberActivities(ns, dictMemberInfo = null, forceTask = null) {
     const dictMembers = dictMemberInfo || (await getGangInfoDict(ns, myGangMembers, 'getMemberInformation'));
     const workOrders = [];
-    const maxMemberDefense = Math.max(...Object.values(dictMembers).map(m => m.def));
     for (const member of Object.values(dictMembers)) { // Set the desired activity of each member
         let task = forceTask ? forceTask : assignedTasks[member.name];
-        if (forceTask == "Territory Warfare" && myGangInfo.territoryClashChance > 0 && (member.def < 100 || member.def < Math.min(10000, maxMemberDefense * 0.1)))
-            task = assignedTasks[member.name]; // Hack: Spare low-defense members from engaging in in warfare since they have a higher chance of dying
         if (member.task != task) workOrders.push({ name: member.name, task }); // Only bother with the API call if this isn't their current task
     }
     if (workOrders.length == 0) return;
     // Set the activities in bulk using a ram-dodging script
     if (await getNsDataThroughFile(ns, `${JSON.stringify(workOrders)}.reduce((success, m) => success && ns.gang.setMemberTask(m.name, m.task), true)`, '/Temp/gang-set-member-tasks.txt'))
-        log(ns, `INFO: Assigned ${workOrders.length}/${Object.keys(dictMembers).length} gang member tasks (${workOrders.map(o => o.task).filter((v, i, self) => self.indexOf(v) === i).join(", ")})`)
+        log(ns, `INFO: Assigned ${workOrders.length} gang member tasks! (${workOrders.map(o => o.task).filter((v, i, self) => self.indexOf(v) === i).join(", ")})`)
     else
         log(ns, `ERROR: Failed to set member task of one or more members: ` + JSON.stringify(workOrders), 'error');
 }
@@ -279,7 +251,7 @@ async function optimizeGangCrime(ns, myGangInfo) {
     let bestTaskAssignments = null, bestWanted = 0;
     let bestTotalGain = myGangInfo.wantedLevelGainRate > wantedGainTolerance ? 0 : // Forget our past achievements, we're gaining wanted levels too fast right now
         optStat == "respect" ? myGangInfo.respectGainRate : myGangInfo.moneyGainRate; // Must do better than the current gain rate if it's within our wanted threshold
-    for (let shuffle = 0; shuffle < 100; shuffle++) { // We can discover more optimal results by greedy-optimizing gang members in a different order. Try a few.
+    for (let shuffle = 0; shuffle < 1000; shuffle++) { // We can discover more optimal results by greedy-optimizing gang members in a different order. Try a few.
         let proposedTasks = {}, totalWanted = 0, totalGain = 0;
         shuffleArray(myGangMembers.slice()).forEach((member, index) => {
             const taskRates = memberTaskRates[member];
@@ -321,7 +293,7 @@ async function optimizeGangCrime(ns, myGangInfo) {
             log(ns, `WARNING: Calculated new rates would be Rep:${formatNumberShort(optRespect)} Wanted: ${optWanted.toPrecision(3)} Money: ${formatMoney(optMoney)}` +
                 `but they are Rep:${formatNumberShort(myGangInfo.respectGainRate)} Wanted: ${myGangInfo.wantedLevelGainRate.toPrecision(3)} Money: ${formatMoney(myGangInfo.moneyGainRate)}`, 'warning');
     } else
-        log(ns, `INFO: Determined all ${myGangMembers.length} gang member assignments are already optimal for ${optStat} with wanted gain tolerance ${wantedGainTolerance.toPrecision(2)} (${elapsed} ms).`);
+        log(ns, `INFO: Determined all gang member assignments are already optimal for ${optStat} with wanted gain tolerance ${wantedGainTolerance.toPrecision(2)} (${elapsed} ms).`);
     // Fail-safe: If we somehow over-shot and are generating wanted levels, start randomly assigning members to vigilante to fix it
     if (myGangInfo.wantedLevelGainRate > wantedGainTolerance) await fixWantedGainRate(ns, myGangInfo, wantedGainTolerance);
 }
@@ -389,9 +361,11 @@ async function tryUpgradeMembers(ns, dictMembers) {
     // Upgrade members, spending no more than x% of our money per tick (and respecting the global reseve)
     const purchaseOrder = [];
     const playerData = await getNsDataThroughFile(ns, 'ns.getPlayer()', '/Temp/player-info.txt');
-    const homeMoney = playerData.money - (options['reserve'] != null ? options['reserve'] : Number(ns.read("reserve.txt") || 0));
-    let budget = (options['equipment-budget'] || defaultMaxSpendPerTickTransientEquipment) * homeMoney;
-    let augBudget = (options['augmentations-budget'] || defaultMaxSpendPerTickPermanentEquipment) * homeMoney;
+    const homeMoney = playerData.money - (Number.parseFloat(ns.read("reserve.txt")) || 0);
+    let budget = maxSpendPerTickTransientEquipment * homeMoney;
+    let augBudget = maxSpendPerTickPermanentEquipment * homeMoney;
+    // Hack: Budget is cut by 1/100 if we don't yet own the Stockmarket 4S API (main source of income early BN)
+    if (!playerData.has4SDataTixApi) budget /= 100, augBudget /= 100;
     if (budget <= 0) return;
     // Find out what outstanding equipment can be bought within our budget
     for (const equip of equipments) {

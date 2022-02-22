@@ -9,12 +9,11 @@ const workByFaction = {}
 
 let options;
 const argsSchema = [
-    ['shock-recovery', 0.25], // Set to a number between 0 and 1 to devote that much time to shock recovery
+    ['shock-recovery', 0.99], // Set to a number between 0 and 1 to devote that much time to shock recovery
     ['crime', ''],
     ['aug-budget', 0.1], // Spend up to this much of current cash on augs per tick (Default is high, because these are permanent for the rest of the BN)
     ['buy-cooldown', 60 * 1000], // Must wait this may milliseconds before buying more augs for a sleeve
     ['min-aug-batch', 20], // Must be able to afford at least this many augs before we pull the trigger (or fewer if buying all remaining augs)
-    ['reserve', null], // Reserve this much cash before determining spending budgets (defaults to contents of reserve.txt if not specified)
 ];
 
 export function autocomplete(data, _) {
@@ -40,7 +39,7 @@ export async function main(ns) {
         availableAugs[i] = null;
 
     while (true) {
-        let cash = ns.getServerMoneyAvailable("home") - (options['reserve'] != null ? options['reserve'] : Number(ns.read("reserve.txt") || 0));
+        let cash = ns.getServerMoneyAvailable("home") - Number(ns.read("reserve.txt"));
         let budget = cash * options['aug-budget'];
         let playerInfo = await getNsDataThroughFile(ns, 'ns.getPlayer()', '/Temp/player-info.txt')
         for (let i = 0; i < numSleeves; i++) {
@@ -77,6 +76,10 @@ export async function main(ns) {
                     log(ns, `INFO: Sleeve ${i} is syncing... ${sync.toFixed(2)}%`);
                     lastUpdate[i] = Date.now();
                 }
+            } else if (!(await getNsDataThroughFile(ns, 'ns.gang.inGang()', '/Temp/player-gang-joined.txt'))) { //Get karma for gang
+                let crime = options.crime || (sleeveStats.strength < 40 ? 'mug' : 'homicide');
+                designatedTask = `commit ${crime}`;
+                command = `ns.sleeve.setToCommitCrime(${i}, '${crime}')`;
             } else if (shock > 0 && options['shock-recovery'] > 0 && Math.random() < options['shock-recovery']) { // Recover from shock
                 designatedTask = "recover from shock";
                 command = `ns.sleeve.setToShockRecovery(${i})`;
